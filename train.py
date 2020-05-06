@@ -16,6 +16,8 @@ from models import RealNVP, RealNVPLoss
 from tqdm import tqdm
 import numpy as np
 
+DATASET = torchvision.datasets.MNIST  # torchvision.datasets.CIFAR10 #
+N_TRAIN = 1000
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() and len(args.gpu_ids) > 0 else 'cpu'
@@ -31,15 +33,12 @@ def main(args):
         transforms.ToTensor()
     ])
 
-    DATASET = torchvision.datasets.MNIST # torchvision.datasets.CIFAR10 #
-
     trainset = DATASET(root='data', train=True, download=True, transform=transform_train)
     trainloader = data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
     testset = DATASET(root='data', train=False, download=True, transform=transform_test)
     testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    N_TRAIN = 1000
     train_idx = np.random.choice(np.arange(trainset.data.shape[0]), size=N_TRAIN, replace=False)
     trainset.data = trainset.data[train_idx]
     trainset.targets = np.array(trainset.targets)[train_idx]
