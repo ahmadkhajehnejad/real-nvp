@@ -16,7 +16,7 @@ from models import RealNVP, RealNVPLoss
 from tqdm import tqdm
 import numpy as np
 
-DATASET = torchvision.datasets.MNIST  # torchvision.datasets.CIFAR10 #
+DATASET = torchvision.datasets.CIFAR10 # torchvision.datasets.MNIST  #
 N_TRAIN = 1000
 
 def main(args):
@@ -33,15 +33,26 @@ def main(args):
         transforms.ToTensor()
     ])
 
-    trainset = DATASET(root='data', train=True, download=True, transform=transform_train)
-    trainloader = data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    assert DATASET in ['mnist', 'cifar10']
+    if DATASET == 'mnist':
+        dataset_picker = torchvision.datasets.MNIST
+    else:
+        dataset_picker = torchvision.datasets.CIFAR10
 
-    testset = DATASET(root='data', train=False, download=True, transform=transform_test)
-    testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    trainset = dataset_picker(root='data', train=True, download=True, transform=transform_train)
+    testset = dataset_picker(root='data', train=False, download=True, transform=transform_test)
 
     train_idx = np.random.choice(np.arange(trainset.data.shape[0]), size=N_TRAIN, replace=False)
+
     trainset.data = trainset.data[train_idx]
-    trainset.targets = np.array(trainset.targets)[train_idx]
+
+    if DATASET == 'mnist':
+        trainset.targets = trainset.targets[train_idx]
+    else:
+        trainset.targets = np.array(trainset.targets)[train_idx]
+
+    trainloader = data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Model
     print('Building model..')
@@ -122,8 +133,8 @@ def test(epoch, net, testloader, device, loss_fn, num_samples):
                 progress_bar.set_postfix(loss=loss_meter.avg,
                                          bpd=util.bits_per_dim(x, loss_meter.avg))
                 progress_bar.update(x.size(0))
-            print('\ntrain loss = ', loss_meter.avg)
-            print('train pbd = ', util.bits_per_dim(x, loss_meter.avg), '\n')
+            print('\ntest loss = ', loss_meter.avg)
+            print('test pbd = ', util.bits_per_dim(x, loss_meter.avg), '\n')
 
     # Save checkpoint
     if loss_meter.avg < best_loss:
