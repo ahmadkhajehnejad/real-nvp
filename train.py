@@ -22,7 +22,7 @@ N_TRAIN = 1000
 N_VAL = 250
 N_TEST = 1000
 N_NOISY_SAMPLES_PER_TEST_SAMPLE = 100
-PATIENCE = 20
+PATIENCE = 30
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() and len(args.gpu_ids) > 0 else 'cpu'
