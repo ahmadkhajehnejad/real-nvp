@@ -15,9 +15,14 @@ import util
 from models import RealNVP, RealNVPLoss
 from tqdm import tqdm
 import numpy as np
+import copy
 
-DATASET = torchvision.datasets.CIFAR10 # torchvision.datasets.MNIST  #
+DATASET = 'mnist' # 'cifar10  #
 N_TRAIN = 1000
+N_VAL = 250
+N_TEST = 1000
+N_NOISY_SAMPLES_PER_TEST_SAMPLE = 100
+PATIENCE = 20
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() and len(args.gpu_ids) > 0 else 'cpu'
@@ -42,21 +47,48 @@ def main(args):
     trainset = dataset_picker(root='data', train=True, download=True, transform=transform_train)
     testset = dataset_picker(root='data', train=False, download=True, transform=transform_test)
 
-    train_idx = np.random.choice(np.arange(trainset.data.shape[0]), size=N_TRAIN, replace=False)
+    valset = copy.deepcopy(trainset)
 
+    train_val_idx = np.random.choice(np.arange(trainset.data.shape[0]), size=N_TRAIN+N_VAL, replace=False)
+    train_idx = train_val_idx[:N_TRAIN]
+    val_idx = train_val_idx[N_TRAIN:]
+    valset.data = valset.data[val_idx]
     trainset.data = trainset.data[train_idx]
+
+
+    test_idx = np.random.choice(np.arange(testset.data.shape[0]), size=N_TRAIN, replace=False)
+    testset.data = testset.data[test_idx]
 
     if DATASET == 'mnist':
         trainset.targets = trainset.targets[train_idx]
+        valset.targets = valset.targets[val_idx]
+        testset.targets = testset.targets[test_idx]
     else:
         trainset.targets = np.array(trainset.targets)[train_idx]
+        valset.targets = np.array(valset.targets)[val_idx]
+        testset.targets = np.array(testset.targets)[test_idx]
+
+    noisytestset = copy.deepcopy(testset)
+    if DATASET == 'mnist':
+        noisy_samples = torch.rand((N_TEST * N_NOISY_SAMPLES_PER_TEST_SAMPLE, 28, 28), dtype=torch.float32) - 0.5
+        noisytestset.data = noisytestset.data.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1) + noisy_samples
+        noisytestset.targets = noisytestset.targets.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE)
+    else:
+        noisy_samples = torch.rand((N_TEST * N_NOISY_SAMPLES_PER_TEST_SAMPLE, 3, 32, 32), dtype=torch.float32) - 0.5
+        noisytestset.data = noisytestset.data.repeat((N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1, 1)) + noisy_samples
+        noisytestset.targets = np.tile(noisytestset.targets, [N_NOISY_SAMPLES_PER_TEST_SAMPLE])
 
     trainloader = data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    valloader = data.DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    noisytestloader = data.DataLoader(noisytestset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Model
     print('Building model..')
-    net = RealNVP(num_scales=2, in_channels=3, mid_channels=64, num_blocks=8)
+    if DATASET == 'mnist':
+        net = RealNVP(num_scales=2, in_channels=1, mid_channels=64, num_blocks=8)
+    else:
+        net = RealNVP(num_scales=2, in_channels=3, mid_channels=64, num_blocks=8)
     net = net.to(device)
     if device == 'cuda':
         net = torch.nn.DataParallel(net, args.gpu_ids)
@@ -76,9 +108,25 @@ def main(args):
     param_groups = util.get_param_groups(net, args.weight_decay, norm_suffix='weight_g')
     optimizer = optim.Adam(param_groups, lr=args.lr)
 
+
+    global cnt_early_stop
+    global best_loss
+
     for epoch in range(start_epoch, start_epoch + args.num_epochs):
         train(epoch, net, trainloader, device, optimizer, loss_fn, args.max_grad_norm)
-        test(epoch, net, testloader, device, loss_fn, args.num_samples)
+        prev_best_loss = best_loss
+        test(epoch, net, valloader, device, loss_fn, args.num_samples, 'val')
+        if best_loss < prev_best_loss:
+            cnt_early_stop = 0
+        else:
+            cnt_early_stop += 1
+        if cnt_early_stop >= PATIENCE:
+            break
+
+    checkpoint = torch.load('ckpts/best.pth.tar')
+    net.load_state_dict(checkpoint['net'])
+    test(epoch, net, testloader, device, loss_fn, args.num_samples, 'test')
+    test(epoch, net, noisytestloader, device, loss_fn, args.num_samples, 'noisytest')
 
 
 def train(epoch, net, trainloader, device, optimizer, loss_fn, max_grad_norm):
@@ -112,14 +160,18 @@ def sample(net, batch_size, device):
         batch_size (int): Number of samples to generate.
         device (torch.device): Device to use.
     """
-    z = torch.randn((batch_size, 3, 32, 32), dtype=torch.float32, device=device)
+
+    if DATASET == 'mnist':
+        z = torch.randn((batch_size, 1, 32, 32), dtype=torch.float32, device=device)
+    else:
+        z = torch.randn((batch_size, 3, 32, 32), dtype=torch.float32, device=device)
     x, _ = net(z, reverse=True)
     x = torch.sigmoid(x)
 
     return x
 
 
-def test(epoch, net, testloader, device, loss_fn, num_samples):
+def test(epoch, net, testloader, device, loss_fn, num_samples, label):
     global best_loss
     net.eval()
     loss_meter = util.AverageMeter()
@@ -133,15 +185,15 @@ def test(epoch, net, testloader, device, loss_fn, num_samples):
                 progress_bar.set_postfix(loss=loss_meter.avg,
                                          bpd=util.bits_per_dim(x, loss_meter.avg))
                 progress_bar.update(x.size(0))
-            print('\ntest loss = ', loss_meter.avg)
-            print('test pbd = ', util.bits_per_dim(x, loss_meter.avg), '\n')
+            print('\n' + label + ' loss = ', loss_meter.avg)
+            print(label + ' pbd = ', util.bits_per_dim(x, loss_meter.avg), '\n')
 
     # Save checkpoint
-    if loss_meter.avg < best_loss:
+    if label == 'val' and loss_meter.avg < best_loss:
         print('Saving...')
         state = {
             'net': net.state_dict(),
-            'test_loss': loss_meter.avg,
+            'val_loss': loss_meter.avg,
             'epoch': epoch,
         }
         os.makedirs('ckpts', exist_ok=True)
@@ -161,15 +213,16 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', default=64, type=int, help='Batch size')
     parser.add_argument('--benchmark', action='store_true', help='Turn on CUDNN benchmarking')
     parser.add_argument('--gpu_ids', default='[0]', type=eval, help='IDs of GPUs to use')
-    parser.add_argument('--lr', default=1e-3, type=float, help='Learning rate')
+    parser.add_argument('--lr', default=3e-4, type=float, help='Learning rate')
     parser.add_argument('--max_grad_norm', type=float, default=100., help='Max gradient norm for clipping')
-    parser.add_argument('--num_epochs', default=100, type=int, help='Number of epochs to train')
+    parser.add_argument('--num_epochs', default=1000, type=int, help='Number of epochs to train')
     parser.add_argument('--num_samples', default=64, type=int, help='Number of samples at test time')
     parser.add_argument('--num_workers', default=8, type=int, help='Number of data loader threads')
     parser.add_argument('--resume', '-r', action='store_true', help='Resume from checkpoint')
     parser.add_argument('--weight_decay', default=5e-5, type=float,
                         help='L2 regularization (only applied to the weight norm scale factors)')
 
-    best_loss = 0
+    best_loss = np.Inf
+    cnt_early_stop = 0
 
     main(parser.parse_args())
