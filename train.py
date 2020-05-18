@@ -16,26 +16,53 @@ from models import RealNVP, RealNVPLoss
 from tqdm import tqdm
 import numpy as np
 import copy
+from PIL import Image
 
 DATASET = 'mnist' # 'cifar10  #
-N_TRAIN = 1000
-N_VAL = 250
+N_TRAIN = 300
+N_VAL = 75
 N_TEST = 1000
 N_NOISY_SAMPLES_PER_TEST_SAMPLE = 100
-PATIENCE = 30
+PATIENCE = 20
+
+
+class MyToTensor(object):
+    def __call__(self, pic):
+        pic = np.array(pic).astype(np.float32) / 256
+        if pic.ndim < 3:
+            pic = pic[:, :, None]
+        return torch.from_numpy(pic.transpose((2, 0, 1)))
+
+
+    def __repr__(self):
+        return self.__class__.__name__ + '()'
+
+
+def get_noisy_data(data, targets):
+    noisy_samples_np = np.random.rand(data.shape[0] * N_NOISY_SAMPLES_PER_TEST_SAMPLE * 28 * 28) * 1.0
+    noisy_samples = torch.from_numpy(noisy_samples_np.reshape([-1,28,28]).astype(np.float32))
+    noisy_data = data.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1).float() + noisy_samples
+    noisy_targets = targets.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE)
+    return noisy_data, noisy_targets
+
 
 def main(args):
+    global best_loss
+    global cnt_early_stop
+
     device = 'cuda' if torch.cuda.is_available() and len(args.gpu_ids) > 0 else 'cpu'
     start_epoch = 0
 
     # Note: No normalization applied, since RealNVP expects inputs in (0, 1).
     transform_train = transforms.Compose([
         transforms.RandomHorizontalFlip(),
-        transforms.ToTensor()
+        MyToTensor()
+        # transforms.ToTensor()
     ])
 
     transform_test = transforms.Compose([
-        transforms.ToTensor()
+        MyToTensor()
+        #transforms.ToTensor()
     ])
 
     assert DATASET in ['mnist', 'cifar10']
@@ -56,7 +83,7 @@ def main(args):
     trainset.data = trainset.data[train_idx]
 
 
-    test_idx = np.random.choice(np.arange(testset.data.shape[0]), size=N_TRAIN, replace=False)
+    test_idx = np.random.choice(np.arange(testset.data.shape[0]), size=N_TEST, replace=False)
     testset.data = testset.data[test_idx]
 
     if DATASET == 'mnist':
@@ -68,20 +95,21 @@ def main(args):
         valset.targets = np.array(valset.targets)[val_idx]
         testset.targets = np.array(testset.targets)[test_idx]
 
-    noisytestset = copy.deepcopy(testset)
+    # noisytestset = copy.deepcopy(testset)
     if DATASET == 'mnist':
-        noisy_samples = torch.rand((N_TEST * N_NOISY_SAMPLES_PER_TEST_SAMPLE, 28, 28), dtype=torch.float32) - 0.5
-        noisytestset.data = noisytestset.data.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1) + noisy_samples
-        noisytestset.targets = noisytestset.targets.repeat(N_NOISY_SAMPLES_PER_TEST_SAMPLE)
+        trainset.data, trainset.targets = get_noisy_data(trainset.data, trainset.targets)
+        valset.data, valset.targets = get_noisy_data(valset.data, valset.targets)
+        testset.data, testset.targets = get_noisy_data(testset.data, testset.targets)
+
     else:
-        noisy_samples = torch.rand((N_TEST * N_NOISY_SAMPLES_PER_TEST_SAMPLE, 3, 32, 32), dtype=torch.float32) - 0.5
-        noisytestset.data = noisytestset.data.repeat((N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1, 1)) + noisy_samples
+        noisy_samples = np.random.rand(N_TEST * N_NOISY_SAMPLES_PER_TEST_SAMPLE, 32, 32, 3) - 0.5
+        noisytestset.data = np.tile( noisytestset.data, (N_NOISY_SAMPLES_PER_TEST_SAMPLE, 1, 1, 1)) + noisy_samples
         noisytestset.targets = np.tile(noisytestset.targets, [N_NOISY_SAMPLES_PER_TEST_SAMPLE])
 
     trainloader = data.DataLoader(trainset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     testloader = data.DataLoader(testset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     valloader = data.DataLoader(valset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    noisytestloader = data.DataLoader(noisytestset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    # noisytestloader = data.DataLoader(noisytestset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     # Model
     print('Building model..')
@@ -100,17 +128,12 @@ def main(args):
         assert os.path.isdir('ckpts'), 'Error: no checkpoint directory found!'
         checkpoint = torch.load('ckpts/best.pth.tar')
         net.load_state_dict(checkpoint['net'])
-        global best_loss
-        best_loss = checkpoint['test_loss']
+        best_loss = checkpoint['val_loss']
         start_epoch = checkpoint['epoch']
 
     loss_fn = RealNVPLoss()
     param_groups = util.get_param_groups(net, args.weight_decay, norm_suffix='weight_g')
     optimizer = optim.Adam(param_groups, lr=args.lr)
-
-
-    global cnt_early_stop
-    global best_loss
 
     for epoch in range(start_epoch, start_epoch + args.num_epochs):
         train(epoch, net, trainloader, device, optimizer, loss_fn, args.max_grad_norm)
@@ -122,11 +145,28 @@ def main(args):
             cnt_early_stop += 1
         if cnt_early_stop >= PATIENCE:
             break
+        # test(epoch, net, testloader, device, loss_fn, args.num_samples, 'test')
+        # test(epoch, net, noisytestloader, device, loss_fn, args.num_samples, 'noisytest')
 
     checkpoint = torch.load('ckpts/best.pth.tar')
     net.load_state_dict(checkpoint['net'])
+
+    pixelwise_ll = -pixelwise_test(net, testloader, device, loss_fn, args.num_samples)
+    pixelwise_ll = pixelwise_ll.reshape([-1, 28, 28])
+    os.makedirs('pixelwise_loglikelihood', exist_ok=True)
+    for i in range(len(pixelwise_ll)):
+        tmp = np.exp( pixelwise_ll[i] )
+        tmp = 255 * ( tmp / np.max(tmp) )
+        im = Image.fromarray(tmp)
+        im.convert('RGB').save('pixelwise_loglikelihood/' + str(i) + '.png')
+    for i, (x,_) in enumerate(testloader):
+        x_np = np.array(x.cpu(), dtype=np.float)
+        for j in range(args.num_samples):
+            im = Image.fromarray(255 * x_np[j].reshape([28,28]))
+            im.convert('RGB').save('pixelwise_loglikelihood/' + str(j) + '-orig.png')
+        break
     test(epoch, net, testloader, device, loss_fn, args.num_samples, 'test')
-    test(epoch, net, noisytestloader, device, loss_fn, args.num_samples, 'noisytest')
+    # test(epoch, net, noisytestloader, device, loss_fn, args.num_samples, 'noisytest')
 
 
 def train(epoch, net, trainloader, device, optimizer, loss_fn, max_grad_norm):
@@ -178,6 +218,8 @@ def test(epoch, net, testloader, device, loss_fn, num_samples, label):
     with torch.no_grad():
         with tqdm(total=len(testloader.dataset)) as progress_bar:
             for x, _ in testloader:
+                #if True: # label.endswith('test'):
+                #    print(x.shape, x.type(), x.min(), x.max())
                 x = x.to(device)
                 z, sldj = net(x, reverse=False)
                 loss = loss_fn(z, sldj)
@@ -206,6 +248,19 @@ def test(epoch, net, testloader, device, loss_fn, num_samples, label):
     images_concat = torchvision.utils.make_grid(images, nrow=int(num_samples ** 0.5), padding=2, pad_value=255)
     torchvision.utils.save_image(images_concat, 'samples/epoch_{}.png'.format(epoch))
 
+def pixelwise_test( net, testloader, device, loss_fn, num_samples):
+    net.eval()
+    with torch.no_grad():
+        with tqdm(total=len(testloader.dataset)) as progress_bar:
+            for x, _ in testloader:
+                x = x.to(device)
+                z, sldj = net(x, reverse=False)
+                loss = loss_fn(z, sldj, True)
+                break
+
+    loss = np.array(loss.cpu(), dtype=np.float)
+    return loss[:num_samples]
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RealNVP on CIFAR-10')
@@ -226,3 +281,4 @@ if __name__ == '__main__':
     cnt_early_stop = 0
 
     main(parser.parse_args())
+

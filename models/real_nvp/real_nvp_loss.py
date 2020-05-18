@@ -16,13 +16,22 @@ class RealNVPLoss(nn.Module):
         super(RealNVPLoss, self).__init__()
         self.k = k
 
-    def forward(self, z, sldj):
+    def forward(self, z, sldj, pixelwise=False):
         prior_ll = -0.5 * (z ** 2 + np.log(2 * np.pi))
         # prior_ll = prior_ll.view(z.size(0), -1).sum(-1) \
         #            - np.log(self.k) * np.prod(z.size()[1:])
+
+        if pixelwise:
+            prior_ll = prior_ll.reshape(z.size(0), -1) - np.log(self.k)
+            ll = prior_ll + sldj.unsqueeze(-1).repeat([1,prior_ll.size(1)]) / prior_ll.size(1)
+            nll = -ll
+            return nll
+
         prior_ll = prior_ll.reshape(z.size(0), -1).sum(-1) \
             - np.log(self.k) * np.prod(z.size()[1:])
         ll = prior_ll + sldj
         nll = -ll.mean()
 
         return nll
+
+
